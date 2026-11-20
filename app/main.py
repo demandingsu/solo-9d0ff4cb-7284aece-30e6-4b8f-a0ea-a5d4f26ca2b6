@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import db
+from . import db, flights
 from .mosaic import (
     MAX_TILE_ID_LEN,
     TileRecord,
@@ -58,6 +58,7 @@ class Runtime:
     storage_dir: Path
     previews_dir: Path
     versions_dir: Path
+    flights_dir: Path
 
     @classmethod
     def build(cls, root: Path) -> "Runtime":
@@ -65,7 +66,8 @@ class Runtime:
         previews = root / "previews"
         versions = root / "published"
         storage = root / "tiles"
-        for directory in (root, previews, versions, storage):
+        flights_dir = root / "flights"
+        for directory in (root, previews, versions, storage, flights_dir):
             directory.mkdir(parents=True, exist_ok=True)
         return cls(
             data_dir=root,
@@ -73,6 +75,7 @@ class Runtime:
             storage_dir=storage,
             previews_dir=previews,
             versions_dir=versions,
+            flights_dir=flights_dir,
         )
 
 
@@ -744,6 +747,280 @@ def create_app(data_dir: str | os.PathLike[str] | None = None) -> FastAPI:
                 "FROM published_versions ORDER BY seq DESC"
             ).fetchall()
         return JSONResponse([dict(row) for row in rows])
+
+    # ------------------------------------------------------------------ #
+    # Forest change monitoring (multi-temporal flights over a sample area)
+    # ------------------------------------------------------------------ #
+
+    def redirect_flights(
+        msg: str | None = None, err: str | None = None
+    ) -> RedirectResponse:
+        params = []
+        if msg:
+            params.append("msg=" + quote(msg))
+        if err:
+            params.append("err=" + quote(err))
+        url = "/flights" + ("?" + "&".join(params) if params else "")
+        return RedirectResponse(url, status_code=303)
+
+    def build_flights_context(request: Request, conn) -> dict[str, Any]:
+        sample_w = db.get_int_setting(conn, "sample_width", 0)
+        sample_h = db.get_int_setting(conn, "sample_height", 0)
+        flight_rows = conn.execute(
+            "SELECT * FROM flights ORDER BY flight_date"
+        ).fetchall()
+        total_changes = conn.execute(
+            "SELECT COUNT(*) FROM change_records"
+        ).fetchone()[0]
+        transitions = {
+            (row["from_category"], row["to_category"]): row["n"]
+            for row in conn.execute(
+                "SELECT from_category, to_category, COUNT(*) AS n "
+                "FROM change_records GROUP BY from_category, to_category"
+            ).fetchall()
+        }
+        pair_summary: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in conn.execute(
+            "SELECT from_date, to_date, from_category, to_category, COUNT(*) AS n "
+            "FROM change_records GROUP BY from_date, to_date, from_category, "
+            "to_category ORDER BY from_date, to_date"
+        ).fetchall():
+            key = (row["from_date"], row["to_date"])
+            entry = pair_summary.setdefault(
+                key,
+                {"from_date": key[0], "to_date": key[1],
+                 "total": 0, "harvest": 0, "regreen": 0},
+            )
+            entry["total"] += row["n"]
+            if row["from_category"] == flights.CATEGORY_FOREST:
+                entry["harvest"] += row["n"]
+            else:
+                entry["regreen"] += row["n"]
+        sample_changes = [
+            {
+                "x": row["x"],
+                "y": row["y"],
+                "from_date": row["from_date"],
+                "from_token": flights.CATEGORY_TOKEN[row["from_category"]],
+                "to_date": row["to_date"],
+                "to_token": flights.CATEGORY_TOKEN[row["to_category"]],
+            }
+            for row in conn.execute(
+                "SELECT * FROM change_records ORDER BY y, x, from_date LIMIT 30"
+            ).fetchall()
+        ]
+        return {
+            "request": request,
+            "sample": {
+                "width": sample_w,
+                "height": sample_h,
+                "is_set": sample_w > 0 and sample_h > 0,
+                "locked": len(flight_rows) > 0,
+            },
+            "flights": [
+                {
+                    "flight_date": row["flight_date"],
+                    "width": row["width"],
+                    "height": row["height"],
+                    "observed": row["observed_pixels"],
+                    "forest": row["forest_pixels"],
+                    "nonforest": row["observed_pixels"] - row["forest_pixels"],
+                    "registered_at": row["registered_at"],
+                }
+                for row in flight_rows
+            ],
+            "stats": {
+                "total": total_changes,
+                "harvest": transitions.get(
+                    (flights.CATEGORY_FOREST, flights.CATEGORY_NONFOREST), 0
+                ),
+                "regreen": transitions.get(
+                    (flights.CATEGORY_NONFOREST, flights.CATEGORY_FOREST), 0
+                ),
+            },
+            "pairs": list(pair_summary.values()),
+            "changes": sample_changes,
+            "limits": {"max_sample_dim": flights.MAX_SAMPLE_DIM},
+            "flash": request.query_params.get("msg", ""),
+            "flash_error": request.query_params.get("err", ""),
+        }
+
+    @app.get("/flights", response_class=HTMLResponse)
+    def flights_page(request: Request) -> HTMLResponse:
+        with db_lock as conn:
+            context = build_flights_context(request, conn)
+        return templates.TemplateResponse(request, "flights.html", context)
+
+    @app.post("/flights/sample")
+    def set_sample_area(
+        width: str = Form(...),
+        height: str = Form(...),
+    ) -> RedirectResponse:
+        try:
+            w = validate_int(width, "样区宽度")
+            h = validate_int(height, "样区高度")
+            flights.validate_sample_size(w, h)
+        except TileValidationError as exc:
+            return redirect_flights(err=str(exc))
+        with db_lock as conn:
+            current_w = db.get_int_setting(conn, "sample_width", 0)
+            current_h = db.get_int_setting(conn, "sample_height", 0)
+            count = conn.execute("SELECT COUNT(*) FROM flights").fetchone()[0]
+            if count and (w, h) != (current_w, current_h):
+                return redirect_flights(
+                    err=f"已登记 {count} 期航飞，样区尺寸固定为 "
+                    f"{current_w}x{current_h}，不可更改；"
+                    "如需更换样区，请先删除全部航飞登记。"
+                )
+            db.set_setting(conn, "sample_width", w)
+            db.set_setting(conn, "sample_height", h)
+        return redirect_flights(msg=f"固定样区已设为 {w}x{h} 像元。")
+
+    @app.post("/flights/register")
+    async def register_flight(
+        flight_date: str = Form(...),
+        frame: UploadFile = File(...),
+        mask: UploadFile = File(...),
+    ) -> RedirectResponse:
+        frame_bytes = await frame.read(MAX_UPLOAD_BYTES + 1)
+        mask_bytes = await mask.read(MAX_UPLOAD_BYTES + 1)
+        if len(frame_bytes) > MAX_UPLOAD_BYTES or len(mask_bytes) > MAX_UPLOAD_BYTES:
+            return redirect_flights(err="单个上传文件不能超过 64 MB。")
+        with db_lock as conn:
+            sample_w = db.get_int_setting(conn, "sample_width", 0)
+            sample_h = db.get_int_setting(conn, "sample_height", 0)
+        if sample_w < 1 or sample_h < 1:
+            return redirect_flights(err="请先设置固定样区尺寸，再登记航飞。")
+        try:
+            checked = flights.validate_flight_upload(
+                flight_date=flight_date,
+                sample_width=sample_w,
+                sample_height=sample_h,
+                frame_bytes=frame_bytes,
+                mask_bytes=mask_bytes,
+            )
+        except TileValidationError as exc:
+            return redirect_flights(err=str(exc))
+
+        # Stage the files, then swap them in atomically next to any previous
+        # registration for the same date.
+        token = secrets.token_hex(16)
+        subdir = runtime.flights_dir / checked.flight_date
+        subdir.mkdir(parents=True, exist_ok=True)
+        frame_name = f"{token}.png"
+        mask_name = f"{token}.mask.png"
+        staging_dir = subdir / f"{STAGING_PREFIX}{token}"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        (staging_dir / frame_name).write_bytes(checked.frame_bytes)
+        (staging_dir / mask_name).write_bytes(checked.mask_bytes)
+        os.replace(staging_dir / frame_name, subdir / frame_name)
+        os.replace(staging_dir / mask_name, subdir / mask_name)
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        frame_rel = str((subdir / frame_name).relative_to(runtime.flights_dir))
+        mask_rel = str((subdir / mask_name).relative_to(runtime.flights_dir))
+
+        old_rels: tuple[str, str] | None = None
+        try:
+            with db_lock as conn:
+                row = conn.execute(
+                    "SELECT frame_rel, mask_rel FROM flights WHERE flight_date = ?",
+                    (checked.flight_date,),
+                ).fetchone()
+                if row is not None:
+                    old_rels = (row["frame_rel"], row["mask_rel"])
+                conn.execute(
+                    "INSERT INTO flights(flight_date, frame_rel, mask_rel, "
+                    "frame_sha256, mask_sha256, width, height, observed_pixels, "
+                    "forest_pixels, registered_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(flight_date) DO UPDATE SET "
+                    "frame_rel = excluded.frame_rel, "
+                    "mask_rel = excluded.mask_rel, "
+                    "frame_sha256 = excluded.frame_sha256, "
+                    "mask_sha256 = excluded.mask_sha256, "
+                    "width = excluded.width, "
+                    "height = excluded.height, "
+                    "observed_pixels = excluded.observed_pixels, "
+                    "forest_pixels = excluded.forest_pixels, "
+                    "registered_at = excluded.registered_at",
+                    (
+                        checked.flight_date,
+                        frame_rel,
+                        mask_rel,
+                        checked.frame_sha256,
+                        checked.mask_sha256,
+                        checked.width,
+                        checked.height,
+                        checked.observed_pixels,
+                        checked.forest_pixels,
+                        utc_now_iso(),
+                    ),
+                )
+                # Flight row, observations and change records commit together;
+                # on any failure the lock context rolls everything back and the
+                # previously downloadable change table is untouched.
+                stats = flights.apply_flight_observations(
+                    conn, checked.flight_date, checked.observations
+                )
+        except Exception:
+            for rel in (frame_rel, mask_rel):
+                (runtime.flights_dir / rel).unlink(missing_ok=True)
+            print("flight registration failed:\n" + traceback.format_exc(limit=5))
+            return redirect_flights(
+                err="登记失败：航飞与变化表均未改动，原变化 CSV 仍可下载。"
+            )
+
+        # Commit succeeded: the superseded files are no longer referenced.
+        if old_rels:
+            for rel in old_rels:
+                (runtime.flights_dir / rel).unlink(missing_ok=True)
+        action = "已替换" if old_rels else "已登记"
+        return redirect_flights(
+            msg=f"{action}航飞 {checked.flight_date}：观测像元 "
+            f"{checked.observed_pixels}（林地 {checked.forest_pixels}），"
+            f"影响像元 {stats.affected_pixels}，"
+            f"变化记录 -{stats.removed_records}/+{stats.added_records}。"
+        )
+
+    @app.post("/flights/{flight_date}/delete")
+    def delete_flight(flight_date: str) -> RedirectResponse:
+        try:
+            date = flights.validate_flight_date(flight_date)
+        except TileValidationError as exc:
+            return redirect_flights(err=str(exc))
+        with db_lock as conn:
+            row = conn.execute(
+                "SELECT 1 FROM flights WHERE flight_date = ?", (date,)
+            ).fetchone()
+            if row is None:
+                return redirect_flights(err=f"未找到 {date} 的航飞登记。")
+            conn.execute("DELETE FROM flights WHERE flight_date = ?", (date,))
+            stats = flights.apply_flight_observations(conn, date, {})
+        shutil.rmtree(runtime.flights_dir / date, ignore_errors=True)
+        return redirect_flights(
+            msg=f"已删除航飞 {date}：影响像元 {stats.affected_pixels}，"
+            f"变化记录 -{stats.removed_records}/+{stats.added_records}。"
+        )
+
+    @app.get("/flights/changes.csv")
+    def download_changes_csv():
+        with db_lock as conn:
+            rows = conn.execute(
+                "SELECT x, y, from_date, from_category, to_date, to_category "
+                "FROM change_records ORDER BY y, x, from_date, to_date"
+            ).fetchall()
+        data = flights.build_changes_csv(rows).encode("utf-8")
+        from fastapi.responses import Response
+
+        return Response(
+            content=data,
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="changes.csv"',
+                "Content-Length": str(len(data)),
+                "Cache-Control": "no-store",
+            },
+        )
 
     return app
 

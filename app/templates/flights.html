@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>林地变化监测 · 航拍无云画幅合成</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>林地变化监测</h1>
+    <span class="sub">固定样区多期对比 · 透明=未观测 · 只重算受影响的变化记录</span>
+    <nav class="topnav"><a href="/">← 返回画幅合成</a></nav>
+  </header>
+
+  <main>
+    <div class="col">
+      {% if flash %}<div class="flash ok">{{ flash }}</div>{% endif %}
+      {% if flash_error %}<div class="flash err">{{ flash_error }}</div>{% endif %}
+
+      <section class="card">
+        <h2>固定样区
+          {% if sample.is_set %}
+            <span class="badge good">{{ sample.width }}×{{ sample.height }} 像元</span>
+            {% if sample.locked %}<span class="badge warn">已锁定</span>{% endif %}
+          {% else %}
+            <span class="badge warn">未设置</span>
+          {% endif %}
+        </h2>
+        <form method="post" action="/flights/sample">
+          <div class="grid2">
+            <label class="field"><span>宽度 (像元)</span>
+              <input type="number" name="width" min="1" max="{{ limits.max_sample_dim }}"
+                     required value="{{ sample.width if sample.is_set else 256 }}">
+            </label>
+            <label class="field"><span>高度 (像元)</span>
+              <input type="number" name="height" min="1" max="{{ limits.max_sample_dim }}"
+                     required value="{{ sample.height if sample.is_set else 256 }}">
+            </label>
+          </div>
+          <div class="actions">
+            <button type="submit" class="primary">设置样区</button>
+            <span class="small muted">最大 {{ limits.max_sample_dim }}×{{ limits.max_sample_dim }} 像元；
+              登记航飞后尺寸即锁定，删除全部登记后才可更改。</span>
+          </div>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>登记航飞 <span class="hint">已对齐画幅 + 同尺寸黑白掩膜</span></h2>
+        {% if sample.is_set %}
+        <form method="post" action="/flights/register" enctype="multipart/form-data">
+          <label class="field"><span>拍摄日期</span>
+            <input type="date" name="flight_date" required>
+          </label>
+          <label class="field"><span>航飞画幅（{{ sample.width }}×{{ sample.height }} RGBA/RGB PNG，透明 = 未观测）</span>
+            <input type="file" name="frame" accept="image/png" required>
+          </label>
+          <label class="field"><span>林地掩膜（同尺寸纯黑白 PNG，白 = 林地，黑 = 非林地）</span>
+            <input type="file" name="mask" accept="image/png" required>
+          </label>
+          <div class="actions">
+            <button type="submit" class="primary">登记航飞</button>
+            <span class="small muted">同一日期重复登记即替换当日画幅与掩膜。</span>
+          </div>
+        </form>
+        {% else %}
+        <p class="muted small">请先在上方设置固定样区尺寸。</p>
+        {% endif %}
+        <details>
+          <summary>对比与重算规则</summary>
+          <ul class="rules">
+            <li>逐像元按拍摄日期排序，比较<b>相邻的可见观测</b>；中间缺测（透明）的日期会被跳过，变化记在最近两次可见观测之间。</li>
+            <li>类别变化才记录：林地↔非林地。CSV 列出像元坐标、两次日期与各自类别。</li>
+            <li>补录旧日期或替换同日画幅时，只重算该日观测<b>新增、移除或改类</b>所影响的变化记录，其他日期沿用已提取的观测。</li>
+            <li>航飞登记与变化表在同一事务中生效；失败时两者都不变，原变化 CSV 仍可下载。</li>
+          </ul>
+        </details>
+      </section>
+
+      <section class="card">
+        <h2>航飞清单 <span class="hint">{{ flights|length }} 期</span></h2>
+        {% if flights %}
+        <table>
+          <thead>
+            <tr>
+              <th>拍摄日期</th><th class="num">观测像元</th>
+              <th class="num">林地</th><th class="num">非林地</th><th>登记时间</th><th></th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for f in flights %}
+            <tr>
+              <td class="mono">{{ f.flight_date }}</td>
+              <td class="num">{{ f.observed }}</td>
+              <td class="num">{{ f.forest }}</td>
+              <td class="num">{{ f.nonforest }}</td>
+              <td class="small muted">{{ f.registered_at }}</td>
+              <td class="num">
+                <form method="post" action="/flights/{{ f.flight_date }}/delete" style="display:inline"
+                      onsubmit="return confirm('删除航飞 {{ f.flight_date }}？其观测将被移除，跨越该日的变化记录会重新连接。');">
+                  <button type="submit" class="danger small" style="padding:2px 8px">删除</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+          <p class="muted small">还没有航飞登记。设置样区后按拍摄日期登记画幅与掩膜。</p>
+        {% endif %}
+      </section>
+    </div>
+
+    <div class="col">
+      <section class="card">
+        <h2>变化记录 <span class="hint">逐像元 · 相邻可见观测对比</span></h2>
+        <div class="stats" style="margin-top:0">
+          <span>变化记录 <b>{{ stats.total }}</b></span>
+          <span>采伐（林地→非林地） <b>{{ stats.harvest }}</b></span>
+          <span>复绿（非林地→林地） <b>{{ stats.regreen }}</b></span>
+          <span>航飞期数 <b>{{ flights|length }}</b></span>
+        </div>
+        <div class="downloads">
+          <a href="/flights/changes.csv">下载变化 CSV</a>
+        </div>
+        <p class="small muted" style="margin:10px 0 0">
+          CSV 列：<code>x,y,from_date,from_category,to_date,to_category</code>；
+          类别取值为 <code>forest</code>（林地）/ <code>nonforest</code>（非林地）。
+        </p>
+
+        {% if pairs %}
+        <h2 style="margin-top:16px">变化发生在哪两次航飞之间</h2>
+        <table>
+          <thead>
+            <tr><th>起始日期</th><th>结束日期</th><th class="num">变化像元</th><th class="num">采伐</th><th class="num">复绿</th></tr>
+          </thead>
+          <tbody>
+          {% for p in pairs %}
+            <tr>
+              <td class="mono">{{ p.from_date }}</td>
+              <td class="mono">{{ p.to_date }}</td>
+              <td class="num">{{ p.total }}</td>
+              <td class="num">{{ p.harvest }}</td>
+              <td class="num">{{ p.regreen }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% endif %}
+      </section>
+
+      {% if changes %}
+      <section class="card">
+        <h2>记录样例 <span class="hint">前 {{ changes|length }} 条（按像元行序）</span></h2>
+        <table>
+          <thead>
+            <tr><th class="num">X</th><th class="num">Y</th><th>起始</th><th>结束</th><th>变化</th></tr>
+          </thead>
+          <tbody>
+          {% for c in changes %}
+            <tr>
+              <td class="num">{{ c.x }}</td>
+              <td class="num">{{ c.y }}</td>
+              <td class="mono">{{ c.from_date }}</td>
+              <td class="mono">{{ c.to_date }}</td>
+              <td class="small">{{ c.from_token }} → {{ c.to_token }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </section>
+      {% endif %}
+    </div>
+  </main>
+</body>
+</html>

@@ -58,6 +58,50 @@ CREATE TABLE IF NOT EXISTS published_versions (
     png_bytes           INTEGER NOT NULL,
     csv_bytes           INTEGER NOT NULL
 );
+
+-- Forest change monitoring: one registration per capture date.  Reusing a
+-- date replaces the frame/mask; observations are extracted once and stored,
+-- and the change table is repaired incrementally per affected pixel.
+CREATE TABLE IF NOT EXISTS flights (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    flight_date     TEXT    NOT NULL,
+    frame_rel       TEXT    NOT NULL,
+    mask_rel        TEXT    NOT NULL,
+    frame_sha256    TEXT    NOT NULL,
+    mask_sha256     TEXT    NOT NULL,
+    width           INTEGER NOT NULL,
+    height          INTEGER NOT NULL,
+    observed_pixels INTEGER NOT NULL,
+    forest_pixels   INTEGER NOT NULL,
+    registered_at   TEXT    NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_flights_date ON flights(flight_date);
+
+-- Only observed (non-transparent) pixels are stored: category 1 = forest
+-- (white mask), 0 = non-forest (black mask).
+CREATE TABLE IF NOT EXISTS flight_observations (
+    flight_date TEXT    NOT NULL,
+    x           INTEGER NOT NULL,
+    y           INTEGER NOT NULL,
+    category    INTEGER NOT NULL CHECK (category IN (0, 1)),
+    PRIMARY KEY (flight_date, x, y)
+);
+
+CREATE INDEX IF NOT EXISTS ix_observations_pixel
+    ON flight_observations(x, y, flight_date);
+
+-- One row per pixel-level category change between two adjacent *visible*
+-- observations; dates may skip unobserved flights in between.
+CREATE TABLE IF NOT EXISTS change_records (
+    x             INTEGER NOT NULL,
+    y             INTEGER NOT NULL,
+    from_date     TEXT    NOT NULL,
+    from_category INTEGER NOT NULL CHECK (from_category IN (0, 1)),
+    to_date       TEXT    NOT NULL,
+    to_category   INTEGER NOT NULL CHECK (to_category IN (0, 1)),
+    PRIMARY KEY (x, y, from_date, to_date)
+);
 """
 
 DEFAULT_SETTINGS: dict[str, str] = {
@@ -69,6 +113,8 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "draft_covered": "0",
     "draft_transparent": "262144",
     "published_version_id": "",
+    "sample_width": "0",
+    "sample_height": "0",
 }
 
 

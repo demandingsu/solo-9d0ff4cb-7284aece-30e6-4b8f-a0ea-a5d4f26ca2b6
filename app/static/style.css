@@ -34,6 +34,18 @@ header.top {
 header.top h1 { font-size: 19px; margin: 0; font-weight: 650; }
 header.top .sub { color: var(--muted); font-size: 13px; }
 
+.topnav { margin-left: auto; }
+.topnav a {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 13.5px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px 11px;
+  background: var(--panel-2);
+}
+.topnav a:hover { border-color: var(--accent); }
+
 main {
   display: grid;
   grid-template-columns: minmax(320px, 400px) minmax(420px, 1fr);

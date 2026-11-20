@@ -256,12 +256,16 @@ class RenderStats:
     transparent_pixels: int
 
 
-def _flat_pixels(image: Image.Image):
+def flat_pixels(image: Image.Image):
     """Pillow 13 renamed getdata(); support both old and new releases."""
     getter = getattr(image, "get_flattened_data", None)
     if getter is not None:
         return getter()
     return image.getdata()
+
+
+# Backwards-compatible private alias.
+_flat_pixels = flat_pixels
 
 
 def render_mosaic(
